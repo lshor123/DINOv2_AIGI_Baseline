@@ -1,0 +1,7 @@
+loguru==0.7.3
+scikit-learn==1.6.1
+torch==2.5.1
+torchvision==0.20.1
+tqdm==4.67.1
+tensorboard==2.20.0
+huggingface_hub[hf_xet]>=0.27.0

@@ -1,0 +1,37 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Training outputs and model weights
+results/
+robustness/
+runs/
+logs/
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Datasets and temporary files
+datasets/
+data/
+tmp/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Local backup copies
+*.bak*
+*.backup*
+*.pre_zoom
+*.202[0-9]*
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
