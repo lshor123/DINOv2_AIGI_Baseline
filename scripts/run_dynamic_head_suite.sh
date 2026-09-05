@@ -5,8 +5,10 @@ export OMP_NUM_THREADS=8 PYTHONUNBUFFERED=1 PYTHONHASHSEED=1029
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 OUTPUT_ROOT=${DYNAMIC_OUTPUT_ROOT:-/root/autodl-tmp/outputs/dinov2_vitl14_baseline/dynamic_head_20260905}
 G5_CKPT=/root/autodl-tmp/outputs/dinov2_vitl14_baseline/linear_probe_zoom_crop_matrix/G5_headlr_3em4_train_only_deterministic_val/checkpoints/genimage_DINOv2_ViTL14_0902_1731.pt
-GENIMAGE_ROOT=/root/autodl-tmp/datasets/GenImage/genimage_test/test
-CHAMELEON_ROOT=/root/autodl-tmp/datasets/Chameleon/Chameleon/test
+# GENIMAGE_ROOT is exported by activate_dino.sh and also read by options.py.
+# Never reuse it for the benchmark path: training selects from SDv1.4 val.
+GENIMAGE_TEST_DIR=/root/autodl-tmp/datasets/GenImage/genimage_test/test
+CHAMELEON_TEST_DIR=/root/autodl-tmp/datasets/Chameleon/Chameleon/test
 TEST_SETS=(adm_imagenet biggan_imagenet glide_imagenet midjourney_imagenet sdv4_imagenet sdv5_imagenet vqdm_imagenet wukong_imagenet)
 mkdir -p "$OUTPUT_ROOT"
 cd "$REPO_ROOT"
@@ -47,7 +49,8 @@ for specification in D1_dynamic_local:dynamic:1.0 C1_linear_continue:linear:0.0 
     touch "$run_root/TRAINING_STARTED"
     printf '%s\tTRAIN_START\t%s\n' "$(date --iso-8601=seconds)" "$run" >> "$STATUS_FILE"
     python main.py "${common[@]}" --classifier_type "$head" --local_weight "$local_weight" \
-      --init_ckpt "$G5_CKPT" --output_root "$run_root" --test_sets stable_diffusion_v_1_4 \
+      --init_ckpt "$G5_CKPT" --output_root "$run_root" \
+      --test_root /root/autodl-tmp/datasets/GenImage --test_sets stable_diffusion_v_1_4 \
       2>&1 | tee -a "$run_root/train_console.log"
     printf '%s\tTRAIN_COMPLETE\t%s\n' "$(date --iso-8601=seconds)" "$run" >> "$STATUS_FILE"
   fi
@@ -57,10 +60,10 @@ for specification in D1_dynamic_local:dynamic:1.0 C1_linear_continue:linear:0.0 
     stage="${benchmark}_eval"
     [[ -f "$run_root/${benchmark^^}_EVAL_FINISHED" ]] && continue
     if [[ "$benchmark" == genimage ]]; then
-      root="$GENIMAGE_ROOT"
+      root="$GENIMAGE_TEST_DIR"
       subsets=("${TEST_SETS[@]}")
     else
-      root="$CHAMELEON_ROOT"
+      root="$CHAMELEON_TEST_DIR"
       subsets=(.)
     fi
     printf '%s\tEVAL_START\t%s\t%s\n' "$(date --iso-8601=seconds)" "$run" "$benchmark" >> "$STATUS_FILE"
