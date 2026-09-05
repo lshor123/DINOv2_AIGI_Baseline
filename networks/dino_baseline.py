@@ -4,6 +4,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from networks.dynamic_head import DynamicLinearHead, ResidualMLPHead
+
 
 class DINOv2Baseline(nn.Module):
     """DINOv2 ViT-L/14 followed by a two-class linear classifier."""
@@ -15,6 +17,10 @@ class DINOv2Baseline(nn.Module):
         weights_path: str = "",
         dropout: float = 0.0,
         freeze_backbone: bool = False,
+        classifier_type: str = "linear",
+        dynamic_rank: int = 16,
+        mlp_width: int = 32,
+        head_fp32: bool = False,
     ):
         super().__init__()
         if backbone != "dinov2_vitl14":
@@ -64,6 +70,16 @@ class DINOv2Baseline(nn.Module):
         nn.init.trunc_normal_(self.classifier[-1].weight, std=0.02)
         nn.init.zeros_(self.classifier[-1].bias)
 
+        self.head_fp32 = head_fp32 or classifier_type != "linear"
+        if classifier_type != "linear" and dropout != 0.0:
+            raise ValueError("Residual-head experiments require dropout=0 for local consistency")
+        if classifier_type == "dynamic":
+            self.classifier = DynamicLinearHead(self.classifier, feature_dim, dynamic_rank)
+        elif classifier_type == "mlp":
+            self.classifier = ResidualMLPHead(self.classifier, feature_dim, mlp_width)
+        elif classifier_type != "linear":
+            raise ValueError(f"Unknown classifier_type: {classifier_type}")
+
         if freeze_backbone:
             self.backbone.requires_grad_(False)
 
@@ -92,4 +108,29 @@ class DINOv2Baseline(nn.Module):
         return features
 
     def forward(self, image):
-        return self.classifier(self.forward_features(image))
+        return self.forward_head(self.forward_features(image))
+
+    def forward_head(self, features):
+        if self.head_fp32:
+            with torch.autocast(device_type=features.device.type, enabled=False):
+                return self.classifier(features.float())
+        return self.classifier(features)
+
+    def load_g5_initialization(self, checkpoint_path):
+        """Warm start model weights only, with strict G5 key/shape validation.
+
+        Optimizer/scheduler/epoch counters are deliberately reset. A new run
+        is additional training from G5, not resuming G5's optimizer state.
+        """
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        expected = {k for k in self.state_dict() if k.startswith("backbone.")}
+        expected.update(("classifier.1.weight", "classifier.1.bias"))
+        if set(state) != expected:
+            raise RuntimeError(
+                f"Expected a G5 linear checkpoint; missing={sorted(expected-set(state))}, "
+                f"unexpected={sorted(set(state)-expected)}"
+            )
+        incompatible = self.load_state_dict(state, strict=False)
+        allowed_missing = set(self.state_dict()) - expected
+        if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
+            raise RuntimeError(f"Unexpected G5 initialization mismatch: {incompatible}")

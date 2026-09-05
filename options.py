@@ -39,6 +39,15 @@ class BaseOptions:
         parser.add_argument("--dino_repo", type=str, default=DEFAULT_DINO_REPO)
         parser.add_argument("--dino_weights", type=str, default=DEFAULT_DINO_WEIGHTS)
         parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--classifier_type", choices=["linear", "dynamic", "mlp"], default="linear")
+        parser.add_argument("--dynamic_rank", type=int, default=16)
+        parser.add_argument("--mlp_width", type=int, default=32)
+        parser.add_argument("--local_weight", type=float, default=0.0)
+        parser.add_argument("--local_noise_radius", type=float, default=0.01)
+        parser.add_argument("--head_fp32", action=argparse.BooleanOptionalAction, default=False)
+        parser.add_argument("--init_ckpt", type=str, default="",
+                            help="G5 linear checkpoint to warm start; NOT optimizer/epoch resume")
+        parser.add_argument("--log_every", type=int, default=250)
         parser.add_argument(
             "--freeze_backbone",
             action="store_true",
@@ -122,6 +131,18 @@ class BaseOptions:
 
     def parse(self, print_options=True):
         opt = self.gather_options()
+        if opt.dynamic_rank < 1 or opt.mlp_width < 1:
+            self.parser.error("Head rank and width must be positive")
+        if opt.local_weight < 0 or opt.local_noise_radius <= 0:
+            self.parser.error("local_weight must be nonnegative and local_noise_radius positive")
+        if opt.local_weight and opt.classifier_type != "dynamic":
+            self.parser.error("Only the dynamic head supports local consistency")
+        if opt.classifier_type != "linear" and opt.dropout != 0:
+            self.parser.error("Residual heads require dropout=0.0")
+        if opt.classifier_type != "linear":
+            opt.head_fp32 = True
+        if opt.accumulation_steps < 1 or opt.epochs < 1 or opt.log_every < 1:
+            self.parser.error("epochs, accumulation_steps, and log_every must be positive")
         if not 0.0 <= opt.zoom_crop_prob <= 1.0:
             self.parser.error("--zoom_crop_prob must be between 0 and 1")
         if opt.zoom_crop_scale < 1.0:

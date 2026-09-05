@@ -1,8 +1,11 @@
 import csv
 import datetime
 import os
+import json
 import random
+import subprocess
 import sys
+import time
 
 import numpy as np
 import torch
@@ -12,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data_loading import create_dataloaders
 from networks.dino_baseline import DINOv2Baseline
+from networks.dynamic_head import sample_feature_noise
 from options import BaseOptions
 from validation import validate
 
@@ -101,6 +105,10 @@ def build_model(args):
         weights_path=args.dino_weights,
         dropout=args.dropout,
         freeze_backbone=args.freeze_backbone,
+        classifier_type=args.classifier_type,
+        dynamic_rank=args.dynamic_rank,
+        mlp_width=args.mlp_width,
+        head_fp32=args.head_fp32,
     )
 
 
@@ -160,7 +168,15 @@ def train():
     writer = SummaryWriter(os.path.join(args.output_root, "runs", time_str))
 
     logger.info(f"Using device: {device}")
-    model = build_model(args).to(device)
+    model = build_model(args)
+    if args.init_ckpt:
+        model.load_g5_initialization(args.init_ckpt)
+        logger.info(f"Warm start from G5: {args.init_ckpt}; optimizer and epochs reset")
+    model = model.to(device)
+    git_commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    with open(os.path.join(args.output_root, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump({**vars(args), "git_commit": git_commit,
+                   "epoch_definition": "additional epochs after init_ckpt"}, f, indent=2)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
@@ -180,10 +196,17 @@ def train():
         args.output_root, "checkpoints", f"genimage_DINOv2_ViTL14_{time_str}.pt"
     )
     global_step = 0
+    # Do not let feature-noise sampling change the image shuffle or workers' RNG.
+    noise_generator = torch.Generator(device=device).manual_seed(args.seed + 100003)
+    epoch_metrics_path = os.path.join(args.output_root, "epoch_metrics.jsonl")
+    completed_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
+        running_ce = 0.0
+        running_local = 0.0
+        epoch_start = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
 
         for index, (inputs, labels) in enumerate(dl_train):
@@ -192,9 +215,19 @@ def train():
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=amp_enabled
             ):
-                logits = model(inputs)
-                raw_loss = criterion(logits, labels)
+                features = model.forward_features(inputs)
+                logits = model.forward_head(features)
+                ce_loss = criterion(logits, labels)
+                local_loss = torch.zeros((), device=device)
+                if args.local_weight:
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        epsilon = sample_feature_noise(features, args.local_noise_radius, noise_generator)
+                        local_loss = model.classifier.neighborhood_loss(features, epsilon)
+                raw_loss = ce_loss + args.local_weight * local_loss
                 loss = raw_loss / args.accumulation_steps
+
+            if not torch.isfinite(raw_loss):
+                raise FloatingPointError(f"Non-finite loss at epoch={epoch}, batch={index + 1}")
 
             scaler.scale(loss).backward()
             should_step = (
@@ -205,10 +238,18 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                writer.add_scalar("Loss/classification", raw_loss.item(), global_step)
+                writer.add_scalar("Loss/classification", ce_loss.item(), global_step)
+                writer.add_scalar("Loss/local", local_loss.item(), global_step)
+                writer.add_scalar("Loss/total", raw_loss.item(), global_step)
                 global_step += 1
 
             running_loss += raw_loss.item() * inputs.size(0)
+            running_ce += ce_loss.item() * inputs.size(0)
+            running_local += local_loss.item() * inputs.size(0)
+            if (index + 1) % args.log_every == 0 or index + 1 == len(dl_train):
+                logger.info(f"epoch[{epoch}] batch={index+1}/{len(dl_train)} "
+                            f"ce={ce_loss.item():.6f} local={local_loss.item():.8g} "
+                            f"elapsed={time.monotonic()-epoch_start:.1f}s")
 
         train_loss = running_loss / len(dl_train.dataset)
         logger.info(f"epoch[{epoch}] train_loss={train_loss:.6f}")
@@ -217,17 +258,38 @@ def train():
         logger.info(f"epoch[{epoch}] val_acc={100 * val_acc:.2f}%")
         writer.add_scalar("Accuracy/validation", val_acc, epoch)
         scheduler.step(val_acc)
+        test_acc = None
+        is_best = False
 
         # Intentionally retain the original PPM-CLIP trigger and test-based
         # early-stopping/checkpoint selection as requested.
         if val_acc >= args.val_threshold:
             test_acc = test_epoch(model, dl_test, device, args, time_str)
             logger.info(f"epoch[{epoch}] test_acc={100 * test_acc:.2f}%")
+            is_best = early_stopping.best_score is None or test_acc >= early_stopping.best_score
             early_stopping(test_acc, model, checkpoint_path)
-            if early_stopping.early_stop:
-                break
+            if is_best:
+                with open(os.path.join(args.output_root, "best_checkpoint.json"), "w", encoding="utf-8") as f:
+                    json.dump({"path": checkpoint_path, "epoch": epoch,
+                               "val_acc": val_acc, "selection_test_acc": test_acc,
+                               "git_commit": git_commit, "init_ckpt": args.init_ckpt}, f, indent=2)
+        completed_epochs = epoch
+        with open(epoch_metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"epoch": epoch, "train_loss": train_loss,
+                                "ce_loss": running_ce / len(dl_train.dataset),
+                                "local_loss": running_local / len(dl_train.dataset),
+                                "val_acc": val_acc, "selection_test_acc": test_acc,
+                                "is_best": is_best, "head_lr": optimizer.param_groups[-1]["lr"],
+                                "elapsed_seconds": time.monotonic()-epoch_start}) + "\n")
+        writer.flush()
+        if early_stopping.early_stop:
+            break
 
     writer.close()
+    with open(os.path.join(args.output_root, "training_complete.json"), "w", encoding="utf-8") as f:
+        json.dump({"completed_epochs": completed_epochs,
+                   "early_stopped": early_stopping.early_stop,
+                   "has_selected_checkpoint": early_stopping.best_score is not None}, f, indent=2)
 
 
 if __name__ == "__main__":
